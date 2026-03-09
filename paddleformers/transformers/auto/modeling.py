@@ -221,7 +221,7 @@ class _BaseAutoModelClass:
                     )
         else:
             try:
-                model_class = getattr(import_class, init_class)
+                model_class = getattr(import_class, init_class + "Deprecated")
                 return model_class
             except AttributeError:
                 model_class = getattr(import_class, init_class + "Deprecated")

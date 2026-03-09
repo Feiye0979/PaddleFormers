@@ -20,6 +20,13 @@ import paddle
 
 from ..audio_processing_utils import BatchFeature, SequenceFeatureExtractor
 from ..audio_utils import mel_filter_bank, spectrogram, window_function
+from ..qwen3_omni_moe.modeling import (
+    compare_and_save,
+    mock_by_torch_whisper_get_window,
+    mock_by_torch_whisper_log10,
+    mock_by_torch_whisper_pow,
+    mock_by_torch_whisper_stft,
+)
 from ..tokenizer_utils_base import TensorType
 
 """
@@ -103,15 +110,81 @@ class WhisperFeatureExtractor(SequenceFeatureExtractor):
 
     def _paddle_extract_fbank_features(self, waveform: np.array, device: str = "cpu") -> np.ndarray:
         waveform = paddle.to_tensor(data=waveform).to(device, "float32")
-        window = paddle.audio.functional.get_window(win_length=self.n_fft, dtype="float32", window="hann")
+        if mock_by_torch_whisper_get_window:
+            import torch
+
+            torch_window = torch.hann_window(self.n_fft, device=device)
+            window = paddle.to_tensor(
+                torch_window.to(torch.float32).detach().cpu().numpy(),
+                dtype="float32",
+            ).to(device=device)
+        else:
+            window = paddle.audio.functional.get_window(win_length=self.n_fft, dtype="float32", window="hann")
+        compare_and_save(window, "window_in_extract_fbank_features", True, False)
+
         if self.dither != 0.0:
             waveform += self.dither * paddle.randn(shape=tuple(waveform.shape), dtype=waveform.dtype)
 
-        stft = paddle.signal.stft(n_fft=self.n_fft, hop_length=self.hop_length, window=window, x=waveform)
-        magnitudes = stft[..., :-1].abs() ** 2
+        compare_and_save(waveform, "waveform_in_extract_fbank_features", True, False)
+
+        if mock_by_torch_whisper_stft:
+            import torch
+
+            def convert_paddle_to_torch(paddle_tensor, dtype=torch.float, device="cuda"):
+                return torch.from_numpy(paddle_tensor.astype("float32").detach().cpu().numpy()).to(dtype).to(device)
+
+            torch_window = convert_paddle_to_torch(window, torch.float, device)
+            torch_waveform = convert_paddle_to_torch(waveform, torch.float, device)
+            torch_stft = torch.stft(
+                torch_waveform, self.n_fft, self.hop_length, window=torch_window, return_complex=True
+            )
+            stft = paddle.to_tensor(
+                torch_stft.detach().cpu().numpy(),
+                dtype="complex64",
+            ).to(device=device)
+        else:
+            stft = paddle.signal.stft(n_fft=self.n_fft, hop_length=self.hop_length, window=window, x=waveform)
+        # print("stft: ", type(stft), stft.dtype, stft.shape, stft)
+
+        compare_and_save(stft, "stft_in_extract_fbank_features", True, False)
+
+        if mock_by_torch_whisper_pow:
+            import torch
+
+            torch_stft = torch.from_numpy(stft.detach().cpu().numpy()).to(torch.complex64).to(device=device)
+            torch_magnitudes = torch_stft[..., :-1].abs() ** 2
+            magnitudes = paddle.to_tensor(
+                torch_magnitudes.to(torch.float).detach().cpu().numpy(), dtype=paddle.float32
+            ).to(device=device)
+        else:
+            magnitudes = stft[..., :-1].abs() ** 2
+
+        compare_and_save(stft[..., :-1].abs(), "stft_abs_in_extract_fbank_features", True, False)
+        compare_and_save(magnitudes, "magnitudes_in_extract_fbank_features", True, False)
+
         mel_filters = paddle.to_tensor(data=self.mel_filters).to(device, "float32")
+
+        compare_and_save(mel_filters, "mel_filters_in_extract_fbank_features", True, False)
+
         mel_spec = mel_filters.T @ magnitudes
-        log_spec = paddle.clip(x=mel_spec, min=1e-10).log10()
+
+        compare_and_save(mel_spec, "mel_spec_in_extract_fbank_features", True, False)
+
+        clamp_result = paddle.clip(x=mel_spec, min=1e-10)
+
+        if mock_by_torch_whisper_log10:
+            import torch
+
+            torch_clamp_result = torch.from_numpy(
+                clamp_result.detach().cpu().numpy(),
+            ).to(device=device)
+            torch_log_spec = torch_clamp_result.log10()
+            log_spec = paddle.to_tensor(torch_log_spec.detach().cpu().numpy(), dtype=paddle.float32).to(device=device)
+        else:
+            log_spec = clamp_result.log10()
+
+        compare_and_save(clamp_result, "clamp_result_in_extract_fbank_features", True, False)
+        compare_and_save(log_spec, "log_spec_in_extract_fbank_features", True, False)
 
         if waveform.dim() == 2:
             max_val = paddle.max(paddle.max(log_spec, axis=2, keepdim=True), axis=1, keepdim=True)
@@ -267,6 +340,9 @@ class WhisperFeatureExtractor(SequenceFeatureExtractor):
         if not is_batched:
             raw_speech = [np.asarray([raw_speech]).T]
 
+        for i, single_raw_speech in enumerate(raw_speech):
+            compare_and_save(single_raw_speech, f"raw_speech_{i}_before_pad", True, False)
+
         batched_speech = BatchFeature({"input_features": raw_speech})
         padded_inputs = self.pad(
             batched_speech,
@@ -288,7 +364,11 @@ class WhisperFeatureExtractor(SequenceFeatureExtractor):
 
         input_features = padded_inputs.get("input_features").transpose(2, 0, 1)
 
+        compare_and_save(input_features, "input_features_before_extract", True, False)
+
         input_features = self._paddle_extract_fbank_features(input_features[0], device="cpu")
+
+        compare_and_save(input_features, "input_features_after_extract", True, False)
 
         if isinstance(input_features[0], List):
             padded_inputs["input_features"] = [np.asarray(feature, dtype=np.float32) for feature in input_features]
@@ -302,4 +382,7 @@ class WhisperFeatureExtractor(SequenceFeatureExtractor):
             padded_inputs["num_frames"] = [(len(raw_speech_i) // self.hop_length) for raw_speech_i in raw_speech]
         if return_tensors is not None:
             padded_inputs = padded_inputs.convert_to_tensors(return_tensors)
+
+        compare_and_save(padded_inputs["input_features"], "input_features_of_padded_inputs", True, False)
+        compare_and_save(padded_inputs["attention_mask"], "attention_mask_of_padded_inputs", True, False)
         return padded_inputs

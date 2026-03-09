@@ -174,3 +174,4 @@ log-pdformers
 saved_inputs
 saved_tensors
 configs
+core.*

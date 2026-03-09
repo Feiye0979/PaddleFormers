@@ -58,8 +58,6 @@ from paddleformers.transformers import (
     AutoTokenizer,
     Llama3Tokenizer,
     LlamaTokenizer,
-    Qwen3OmniMoeThinkerConfig,
-    Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 from paddleformers.transformers.configuration_utils import (
     LlmMetaConfig,
@@ -243,12 +241,15 @@ def run_sft(
         quantization_config = dict(weight_quantize_algo=finetuning_args.weight_quantize_algo)
     quantization_config = QuantizationConfig.from_dict(quantization_config)
 
-    # model_config = AutoConfig.from_pretrained(
+    model_config = AutoConfig.from_pretrained(
+        model_args.model_name_or_path,
+        dtype=dtype,
+        quantization_config=quantization_config,
+    )
+    # model_config = Qwen3OmniMoeThinkerConfig.from_pretrained(
     #     model_args.model_name_or_path,
     #     dtype=dtype,
-    #     quantization_config=quantization_config,
     # )
-    model_config = Qwen3OmniMoeThinkerConfig.from_pretrained(model_args.model_name_or_path)
 
     if (
         model_config.tie_word_embeddings
@@ -304,11 +305,15 @@ def run_sft(
     # Sync arguments to MLLM sub_config
     if getattr(model_config, "text_config", None) is not None:
         model_config.text_config.max_sequence_length = data_args.max_seq_len
+        model_config.vision_config._attn_implementation = model_args._attn_implementation
     if getattr(model_config, "vision_config", None) is not None:
         model_config.vision_config._attn_implementation = model_args._attn_implementation
         model_config.vision_config.recompute_granularity = model_config.recompute_granularity
         model_config.vision_config.recompute_method = model_config.recompute_method
         model_config.vision_config.recompute_num_layers = model_config.recompute_num_layers
+    if getattr(model_config, "audio_config", None) is not None:
+        model_config.text_config.max_sequence_length = data_args.max_seq_len
+        model_config.vision_config._attn_implementation = model_args._attn_implementation
 
     # Sync freeze_config to model_config so that Fleet model providers can read it
     freeze_config = getattr(training_args, "freeze_config", "")
@@ -320,31 +325,36 @@ def run_sft(
     # logger.info(f"Final model config: {model_config}")
     logger.info("Creating model")
 
-    # if "VL" in model_args.stage:
-    #     model_class = AutoModelForConditionalGeneration
-    #     if training_args.pipeline_model_parallel_size > 1:
-    #         if data_args.eval_with_do_generation and training_args.do_eval:
-    #             raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
-    #         model_class = AutoModelForConditionalGenerationPipe
-    # else:
-    #     model_class = AutoModelForCausalLM
-    #     if training_args.pipeline_model_parallel_size > 1:
-    #         if data_args.eval_with_do_generation and training_args.do_eval:
-    #             raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
-    #         model_class = AutoModelForCausalLMPipe
+    if "VL" in model_args.stage:
+        model_class = AutoModelForConditionalGeneration
+        if training_args.pipeline_model_parallel_size > 1:
+            if data_args.eval_with_do_generation and training_args.do_eval:
+                raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
+            model_class = AutoModelForConditionalGenerationPipe
+    else:
+        model_class = AutoModelForCausalLM
+        if training_args.pipeline_model_parallel_size > 1:
+            if data_args.eval_with_do_generation and training_args.do_eval:
+                raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
+            model_class = AutoModelForCausalLMPipe
 
-    # if model_args.continue_training and not training_args.autotuner_benchmark:
-    #     model = model_class.from_pretrained(
-    #         model_args.model_name_or_path,
-    #         config=model_config,
-    #         convert_from_hf=training_args.convert_from_hf,
-    #         load_via_cpu=training_args.load_via_cpu,
-    #         load_checkpoint_format=training_args.load_checkpoint_format,
-    #     )
-    # else:
-    #     model = model_class.from_config(model_config, dtype=dtype)
+    if model_args.continue_training and not training_args.autotuner_benchmark:
+        model = model_class.from_pretrained(
+            model_args.model_name_or_path,
+            config=model_config,
+            convert_from_hf=training_args.convert_from_hf,
+            load_via_cpu=training_args.load_via_cpu,
+            load_checkpoint_format=training_args.load_checkpoint_format,
+        )
+    else:
+        model = model_class.from_config(model_config, dtype=dtype)
 
-    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_config(model_config)
+    # model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+    #     model_args.model_name_or_path,
+    #     config=model_config,
+    #     load_checkpoint_format=training_args.load_checkpoint_format,
+    #     dtype=dtype,
+    # )
 
     if training_args.do_train and model_args.neftune:
         # Inspired by https://github.com/neelsjain/NEFTune

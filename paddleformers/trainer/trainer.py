@@ -258,6 +258,8 @@ from paddle.distributed import in_auto_parallel_align_mode
 from paddle.distributed.fleet.utils import mix_precision_utils
 from paddle.io.dataloader.dataloader_iter import _DataLoaderIterBase
 
+from ..transformers.qwen3_omni_moe.modeling import compare_and_save
+
 __all__ = ["Trainer"]
 
 MODEL_NAME = "model"
@@ -2252,6 +2254,25 @@ class Trainer:
                         self.callback_handler.on_optimizer_begin(
                             args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                         )
+
+                        # 打印模型参数及参数梯度
+                        global_step = int(os.environ["TRAINER_GLOBAL_STEP"]) + 1
+                        rank_id = paddle.distributed.get_rank()
+                        step_rank = step_rank = "step" + str(global_step) + "_rank" + str(rank_id)
+                        if global_step == 1:
+                            for name, param in model.named_parameters():
+                                print(
+                                    f"[{step_rank}] param, {name}, md5: {param._md5sum()}, shape: {param.shape}, dtype: {param.dtype}"
+                                )
+                            for name, param in model.named_parameters():
+                                grad = getattr(param, "main_grad", param.grad)
+                                if grad is not None:
+                                    print(
+                                        f"[{step_rank}] param_grad, {name}, md5: {grad._md5sum()}, shape: {grad.shape}, dtype: {grad.dtype}, norm: {grad.norm(p='fro').item()}"
+                                    )
+                                else:
+                                    print(f"[{step_rank}] param_grad, {name}, grad is None")
+
                         self.optimizer_step(args, model=model, parameters_list=parameters_list)
 
                         self.timers and self.timers("optimizer-step").stop()
@@ -3590,8 +3611,11 @@ class Trainer:
             loss = outputs[0]
         else:
             loss = outputs
-        if len(loss) > 0:
+        if hasattr(loss, "ndim") and loss.ndim > 0:
             loss = loss[0]  # hack for some problem in modeling
+
+        compare_and_save(outputs["logits"], "output_ids_logits_after_forward", True, False)
+        compare_and_save(loss, "output_ids_loss_after_forward", True, False)
         return (loss, outputs) if return_outputs else loss
 
     def _enable_delay_scale_loss(self):

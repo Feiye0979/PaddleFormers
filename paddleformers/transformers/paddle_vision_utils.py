@@ -16,6 +16,9 @@
 API for image and video processing, serving as a backend for PaddlePaddle processors.
 """
 
+import hashlib
+import os
+import traceback
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -23,6 +26,43 @@ import paddle
 from paddle.nn.functional import interpolate
 from paddle.nn.functional import pad as paddle_pad
 from PIL import Image
+
+FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/PaddleFormers/saved_tensors/npy/"
+HACK_FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-swift/saved_tensors/npy/"
+
+run_online = True
+mock_switch = True
+
+
+def compare_and_save(data, name: str, to_save: bool = False, print_tensor: bool = False):
+    if run_online:
+        return
+    if print_tensor:
+        print(name, type(data), data.shape if data is not None else None, data)
+    try:
+        if isinstance(data, paddle.Tensor):
+            if data.dtype == paddle.complex64:
+                data_np = data.detach().cpu().numpy()
+            else:
+                data_float = data.astype("float32")
+                data_np = data_float.detach().cpu().numpy()
+        elif isinstance(data, np.ndarray):
+            data_np = data
+        else:
+            data_float = data.float().contiguous()
+            data_np = data_float.detach().cpu().numpy()
+
+        array_bytes = data_np.tobytes()
+        data_md5 = hashlib.md5(array_bytes).hexdigest()
+        print(
+            f"{name} md5: {data_md5}, dtype: {data.dtype}, shape: {data.shape if data is not None else None}, device: {data.device}"
+        )
+        if to_save:
+            os.makedirs(FILE_DIR, exist_ok=True)
+            file = FILE_DIR + name + ".npy"
+            np.save(file, data_np)
+    except:
+        print(name, traceback.format_exc())
 
 
 def get_image_num_channels(img: Any) -> int:
@@ -155,13 +195,28 @@ def resize(
         if need_cast:
             image = image.to(dtype=paddle.float32)
 
-        image = interpolate( #diff happens
-            image,
-            size=[new_height, new_width],
-            mode=interpolation,
-            align_corners=align_corners,
-            antialias=antialias,
-        )
+        compare_and_save(image, "image_before_interpolate", True, False)
+        if mock_switch:
+            import torch
+
+            torch_image = torch.from_numpy(image.astype("float32").detach().cpu().numpy()).to(torch.float).to("cuda")
+            torch_image = torch.nn.functional.interpolate(
+                torch_image,
+                size=[new_height, new_width],
+                mode=interpolation,
+                align_corners=align_corners,
+                antialias=antialias,
+            )
+            image = paddle.to_tensor(torch_image.to(torch.float).detach().cpu().numpy()).to("float32").to("cuda")
+        else:
+            image = interpolate(  # diff happens
+                image,
+                size=[new_height, new_width],
+                mode=interpolation,
+                align_corners=align_corners,
+                antialias=antialias,
+            )
+        compare_and_save(image, "image_after_interpolate", True, False)
 
         if need_cast:
             if interpolation == "bicubic" and dtype == paddle.uint8:
