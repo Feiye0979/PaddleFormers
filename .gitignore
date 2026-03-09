@@ -172,4 +172,5 @@ paddleformers_dist_log
 checkpoints
 log-pdformers
 saved_inputs
+saved_tensors
 configs

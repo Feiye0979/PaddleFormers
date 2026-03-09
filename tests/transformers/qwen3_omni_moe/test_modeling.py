@@ -13,77 +13,88 @@
 # limitations under the License.
 from __future__ import annotations
 
-import glob
 import os
+
+os.environ["FLAGS_use_accuracy_compatible_kernel"] = "1"
+os.environ["FLAGS_embedding_deterministic"] = "1"
+os.environ["FLAGS_cudnn_deterministic"] = "1"
+# os.environ["FLAGS_gemm_use_half_precision_compute_type"] = "1"
+# os.environ["FLAGS_share_tensor_for_grad_tensor_holder"] = "1"
 
 import paddle
 
-paddle.set_printoptions(precision=10)
+paddle.set_printoptions(precision=15)
 
 import torch
 
 torch.set_printoptions(
-    precision=10,  # 小数位数
+    precision=15,  # 小数位数
     sci_mode=False,  # 关闭科学计数法
     linewidth=200,  # 每行字符数，防止被截断
     threshold=10_000,  # 超过这个元素数才省略
 )
+
+mock_by_torch_logits_grad = False
+
+
 import glob
-import os
+import hashlib
 import random
 import sys
-
-import numpy as np
-import paddle
-
-from paddleformers.transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoTokenizer,
-    ProcessorMixin,
-    Qwen2Tokenizer,
-    Qwen3OmniMoeThinkerConfig,
-    Qwen3OmniMoeThinkerForConditionalGeneration,
-    Qwen3VLMoeConfig,
-    Qwen3VLMoeTextConfig,
-)
-
-MODEL_PATH = "/root/paddlejob/workspace/env_run/chenxuran/models/customQwen3-Omni-30B-A3B-Instruct/"
-import hashlib
 import traceback
 
 import numpy as np
+
+from paddleformers.transformers import (
+    Qwen3OmniMoeThinkerConfig,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
+    Qwen3VLMoeConfig,
+    Qwen3VLMoeForConditionalGenerationDeprecated,
+)
+
+FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/PaddleFormers/saved_tensors/npy/"
+HACK_FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-swift/saved_tensors/npy/"
 
 
 def compare_and_save(data, name: str, to_save: bool = False, print_tensor: bool = False):
     if print_tensor:
         print(name, type(data), data.shape if data is not None else None, data)
     try:
-        if isinstance(data, paddle.Tensor):
-            data_float = data.astype("float32")
+        if isinstance(data, dict):
+            if to_save:
+                os.makedirs(FILE_DIR, exist_ok=True)
+                np.savez(os.path.join(FILE_DIR, f"{name}.npz"), **data)
         else:
-            data_float = data.float().contiguous()
-        data_np = data_float.detach().cpu().numpy()
-        array_bytes = data_np.tobytes()
-        data_md5 = hashlib.md5(array_bytes).hexdigest()
-        print(f"{name} md5: {data_md5}")
-        if to_save:
-            file = "/root/paddlejob/workspace/env_run/wuhuiyue/helper/qwen3_omni_test/pd_" + name + ".npy"
-            np.save(file, data_np)
+            if isinstance(data, paddle.Tensor):
+                data_float = data.astype("float32")
+            else:
+                data_float = data.float().contiguous()
+            data_np = data_float.detach().cpu().numpy()
+            array_bytes = data_np.tobytes()
+            data_md5 = hashlib.md5(array_bytes).hexdigest()
+            print(f"{name} md5: {data_md5}, shape: {data.shape if data is not None else None}, device: {data.device}")
+            if to_save:
+                os.makedirs(FILE_DIR, exist_ok=True)
+                file = FILE_DIR + name + ".npy"
+                np.save(file, data_np)
     except:
-        print(traceback.format_exc())
+        print(name, traceback.format_exc())
+
+
+def hack_with_torch_file(name: str, dtype, device):
+    file = HACK_FILE_DIR + name + ".npy"
+    np_data = np.load(file)
+    pd_data = paddle.to_tensor(np_data).astype(dtype=dtype).to(device)
+    return pd_data
 
 
 MODEL_PATH = "/root/.cache/modelscope/hub/models/Qwen/Qwen3-Omni-30B-A3B-Instruct/"
+# MODEL_PATH = "/root/paddlejob/workspace/env_run/wuhuiyue/qwen3_omni/models/customQwen3-Omni-30B-A3B-Instruct/"
 
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 paddle.seed(SEED)
-
-os.environ["FLAGS_use_accuracy_compatible_kernel"] = "1"
-os.environ["FLAGS_embedding_deterministic"] = "1"
-os.environ["FLAGS_cudnn_deterministic"] = "1"
 
 global_rng = random.Random(SEED)
 
@@ -126,7 +137,7 @@ def get_deterministic_inputs(config, float32_switch=False):
     target_dtype = "float32" if float32_switch else "bfloat16"
     batch_size = 1
     seq_length = 512  # 使用较小的序列长度便于调试
-    vocab_size = config.get_text_config().vocab_size
+    # vocab_size = config.get_text_config().vocab_size
     patch_size = config.vision_config.patch_size
     spatial_merge_size = config.vision_config.spatial_merge_size
     temporal_patch_size = config.vision_config.temporal_patch_size
@@ -223,6 +234,7 @@ def get_deterministic_inputs(config, float32_switch=False):
         "video_grid_thw": video_grid_thw,
         "input_features": input_features,
         "feature_attention_mask": feature_attention_mask,
+        "labels": input_ids.clone(),
     }
 
     # 打印输入信息
@@ -253,52 +265,6 @@ def get_random_inputs(config):
     num_mel_bins = 128
     feat_seq_length = 290
 
-    print("output_ids: ", type(output_ids), output_ids)
-
-
-def test_thinker_with_dumped_inputs(dumped_input_path=None):
-    """Test model with dumped inputs from training"""
-    config = Qwen3OmniMoeThinkerConfig.from_pretrained(MODEL_PATH)
-    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_config(config)
-
-    # Find dumped inputs
-    if dumped_input_path is None:
-        # Auto-discover the latest dumped input file
-        dump_dir = "/root/paddlejob/workspace/env_run/chenxuran/dumped_inputs"
-        if not os.path.exists(dump_dir):
-            print(f"Warning: Dump directory {dump_dir} does not exist")
-            print("Please run training first to generate dumped inputs")
-            return
-
-        input_files = glob.glob(os.path.join(dump_dir, "*_inputs.npz"))
-        if not input_files:
-            print(f"Warning: No dumped input files found in {dump_dir}")
-            return
-
-        # Use the latest file
-        dumped_input_path = max(input_files, key=os.path.getmtime)
-
-    print(f"Loading dumped inputs from: {dumped_input_path}")
-
-    # Load dumped inputs
-    loaded_data = np.load(dumped_input_path)
-
-    # Convert numpy arrays back to paddle tensors
-    model_inputs = {}
-    for key in loaded_data.files:
-        model_inputs[key] = paddle.to_tensor(loaded_data[key])
-
-    print(f"Loaded input keys: {list(model_inputs.keys())}")
-    for key, value in model_inputs.items():
-        print(f"  {key}: shape={value.shape}, dtype={value.dtype}")
-
-    # Run model with dumped inputs
-    output_ids = model(**model_inputs)
-
-    print("output_ids: ", type(output_ids), output_ids)
-
-    return output_ids
-
     # calculate image tokens
     num_image_tokens = (image_row_size * image_col_size) // (spatial_merge_size**2)
 
@@ -323,7 +289,7 @@ def test_thinker_with_dumped_inputs(dumped_input_path=None):
         0, num_image_tokens + num_video_tokens : num_image_tokens + num_video_tokens + num_audio_tokens
     ] = config.audio_token_id
 
-    print(f"====== multimodal tokens confirm ======")
+    print("====== multimodal tokens confirm ======")
     print(f"image_token_id: {config.image_token_id}")
     print(f"video_token_id: {config.video_token_id}")
     print(f"audio_token_id: {config.audio_token_id}")
@@ -375,8 +341,14 @@ def test_thinker_with_dumped_inputs(dumped_input_path=None):
     return inputs_dict
 
 
-def test_thinker_text_model():
-    float32_switch = True
+def test_thinker_model():
+    if len(sys.argv) > 1:
+        cmd_dtype = sys.argv[1]
+    else:
+        cmd_dtype = "bfloat16"
+
+    float32_switch = cmd_dtype == "float32" or cmd_dtype == "fp32"
+    print("float32_switch: ", float32_switch)
 
     config = Qwen3OmniMoeThinkerConfig.from_pretrained(MODEL_PATH)
     config.dtype = "float32" if float32_switch else "bfloat16"
@@ -393,34 +365,90 @@ def test_thinker_text_model():
     )
     model.eval()
 
-    # for name, weight in model.state_dict().items():
-    #     weight_md5 = weight._md5sum()
-    #     print(f"{name}:{weight_md5}")
-    #     if name == "model.layers.0.mlp.experts.down_proj":
-    #         print(weight)
+    for k, v in model.state_dict().items():
+        if "conv2d" in k:
+            compare_and_save(v, k, False, False)
 
     origin_inputs_dict = get_deterministic_inputs(config, float32_switch)
 
     target_input_keys = (
         "input_ids",
         "attention_mask",
-        # "input_features",
-        # "feature_attention_mask",
-        # "image_grid_thw",
-        # "pixel_values",
-        # "pixel_values_videos",
-        # "video_grid_thw",
+        "input_features",
+        "feature_attention_mask",
+        "image_grid_thw",
+        "pixel_values",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "labels",
     )
     inputs_dict = {k: v for k, v in origin_inputs_dict.items() if k in target_input_keys}
     for key, value in inputs_dict.items():
         print(f"{key}: shape={value.shape}, dtype={value.dtype}")
         compare_and_save(value, key, False, False)
 
-    output_ids = model(**inputs_dict)
+    if mock_by_torch_logits_grad:
+        # =======================================================
+        # 替换 logits grad
+        # =======================================================
+        print("[Paddle] Running Forward...")
+        # 注意：这里不需要传入 labels，因为我们要手动反向
+        new_inputs_dict = {k: v for k, v in inputs_dict.items() if k != "labels"}
+        output_ids = model(**new_inputs_dict, return_dict=True)
 
-    print("output_ids: ", type(output_ids), output_ids)
+        print("output_ids: ", type(output_ids), output_ids)
 
-    compare_and_save(output_ids.logits, "output_ids", True, False)
+        logits = output_ids.logits
+        loss = output_ids.loss[0] if isinstance(output_ids.loss, tuple) else output_ids.loss
+
+        compare_and_save(logits, "output_ids_logits_after_forward", True, True)
+        compare_and_save(loss, "output_ids_loss_after_forward", True, True)
+
+        # 【关键步骤 1】加载 Torch 算出来的 Logits 梯度
+        logits_grad_pd = hack_with_torch_file(
+            "output_ids_logits_grad_after_backward",
+            dtype=("float32" if float32_switch else "bfloat16"),
+            device="cuda",
+        )
+
+        print("[Paddle] Running Backward with INJECTED Gradients...")
+
+        # 【关键步骤 2】手动反向传播
+        # 含义：计算 logits 的梯度时，已知上游传来的梯度是 logits_grad_pd
+        paddle.autograd.backward(
+            tensors=[logits],  # 我们要对谁求导？(也就是谁是反向的起点) -> logits
+            grad_tensors=[logits_grad_pd],  # 起点的梯度是多少？ -> 注入 Torch 的值
+        )
+
+        compare_and_save(logits, "output_ids_logits_after_backward", True, True)
+        compare_and_save(loss, "output_ids_loss_after_backward", True, True)
+
+    else:
+        output_ids = model(**inputs_dict)
+
+        print("output_ids: ", type(output_ids), output_ids)
+
+        logits = output_ids.logits
+        loss = output_ids.loss[0] if isinstance(output_ids.loss, tuple) else output_ids.loss
+
+        compare_and_save(logits, "output_ids_logits_after_forward", True, True)
+        compare_and_save(loss, "output_ids_loss_after_forward", True, True)
+
+        print("[Paddle] Runing Backward...")
+        loss.backward()
+
+        compare_and_save(logits, "output_ids_logits_after_backward", True, True)
+        compare_and_save(loss, "output_ids_loss_after_backward", True, True)
+
+    print("[Paddle] Saving Gradients...")
+    grads_dict = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grads_dict[name] = param.grad.cast("float32").numpy()
+
+    compare_and_save(grads_dict, "output_ids_grads_after_backward", True, False)
+
+    print("✅ Paddle Done.")
 
 
 def test_thinker_with_dumped_inputs(dumped_input_path=None):
@@ -492,23 +520,8 @@ def qwen3vlmoe():
 
 
 if __name__ == "__main__":
-    import sys
-
-    # print("=" * 60)
-    # print("Test 1: Random input test")
-    # print("=" * 60)
-    # test_thinker_text_model()
-
-    print("\n" + "=" * 60)
-    print("Test 2: Dumped input test")
-    print("=" * 60)
-
-    # Check if a specific dumped input path is provided
-    if len(sys.argv) > 1:
-        test_thinker_with_dumped_inputs(sys.argv[1])
-    else:
-        test_thinker_with_dumped_inputs()
-    test_thinker_text_model()
+    test_thinker_model()
+    # test_talker_model()
     # qwen3vlmoe()
 
     # print("\n" + "=" * 60)
