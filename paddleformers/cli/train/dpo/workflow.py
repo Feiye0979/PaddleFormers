@@ -325,6 +325,8 @@ def run_dpo(
         "stage": model_args.stage,
         "template_backend": data_args.template_backend,
         "use_filtered_label_loss": model_config.use_filtered_label_loss,
+        "binpacking": data_args.binpacking,
+        "packing_interval": data_args.packing_interval,
         "dtype": compute_type,
     }
 
