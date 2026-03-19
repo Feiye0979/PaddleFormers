@@ -54,6 +54,7 @@ def compute_metrics(eval_preds):
 
 def get_lora_target_modules(model):
     # Not yet support RowParallelLinear
+    logger.info(f"get_lora_target_modules model_type: {model.config.model_type}")
     if model.config.model_type == "chatglm":
         target_modules = [".*query_key_value.*", ".*dense.*", ".*dense_h_to_4h.*", ".*dense_4h_to_h.*"]
     elif model.config.model_type == "chatglm_v2":
@@ -250,6 +251,46 @@ def get_lora_target_modules(model):
             ".*gate_proj.*",
             ".*up_proj.*",
             ".*down_proj.*",
+        ]
+    elif model.config.model_type in ["qwen3_omni_moe", "qwen3_omni_moe_thinker"]:
+        # Use path-specific prefixes so that get_multimodel_lora_target_modules
+        # can correctly filter vision / audio / aligner layers via freeze_config.
+        # qwen3_omni_moe wraps everything under "thinker.*";
+        # qwen3_omni_moe_thinker is the thinker sub-model itself (no "thinker." prefix).
+        _is_thinker = model.config.model_type == "qwen3_omni_moe_thinker"
+        _llm = "model\\." if _is_thinker else "thinker\\.model\\."
+        _vision = "visual\\." if _is_thinker else "thinker\\.visual\\."
+        _audio = "audio_tower\\." if _is_thinker else "thinker\\.audio_tower\\."
+        target_modules = [
+            # LLM attention
+            f".*{_llm}.*\\.q_proj.*",
+            f".*{_llm}.*\\.k_proj.*",
+            f".*{_llm}.*\\.v_proj.*",
+            f".*{_llm}.*\\.o_proj.*",
+            # LLM FFN (dense + MoE experts)
+            f".*{_llm}model.*\\.gate_proj.*",
+            f".*{_llm}model.*\\.up_proj.*",
+            f".*{_llm}model.*\\.down_proj.*",
+            f".*{_llm}model.*\\.gate_up_proj.*",
+            # Vision encoder attention + FFN
+            f".*{_vision}.*attn\\.qkv.*",
+            f".*{_vision}.*attn\\.proj.*",
+            f".*{_vision}.*linear_fc1.*",
+            f".*{_vision}.*linear_fc2.*",
+            # Vision aligner
+            f".*{_vision}.*\\.merger.*mlp.*"
+            f".*{_vision}.*\\.merger_list.*mlp.*"
+            # Audio encoder attention + FFN
+            f".*{_audio}.*\\.q_proj.*",
+            f".*{_audio}.*\\.k_proj.*",
+            f".*{_audio}.*\\.v_proj.*",
+            f".*{_audio}.*\\.out_proj.*",
+            f".*{_audio}.*\\.fc1.*",
+            f".*{_audio}.*\\.fc2.*",
+            f".*{_audio}.*\\.conv_out.*",
+            # Audio projectors (aligner)
+            f".*{_audio}proj1.*",
+            f".*{_audio}proj2.*",
         ]
     elif model.config.model_type in ["deepseek_v3"]:
         target_modules = [

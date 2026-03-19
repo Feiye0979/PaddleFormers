@@ -1755,6 +1755,23 @@ class Trainer:
         if not args.enable_auto_parallel and self.args.offload_optim:
             self._reload_optimizer()
 
+        # Compute grad_norm for Sharding Stage3 (not covered by HybridParallelOptimizer path)
+        if (
+            not isinstance(self.optimizer, HybridParallelOptimizer)
+            and (
+                ShardingOption.FULL_SHARD in args.sharding
+                or ShardingOption.SHARD_GRAD_OP in args.sharding
+            )
+            and args.max_grad_norm > 0
+        ):
+            _sq_sum = paddle.zeros([1], dtype="float32")
+            for p in model.parameters():
+                grad = getattr(p, "main_grad", p.grad)
+                if grad is not None:
+                    _sq_sum += (grad.astype("float32") ** 2).sum()
+            dist.all_reduce(_sq_sum, op=dist.ReduceOp.SUM)
+            self.global_training_logs["global_norm"] = float(_sq_sum.sqrt().item())
+
         if self.do_grad_scaling:
             scale_before = paddle.assign(self.scaler._scale)
             self.scaler.step(self.optimizer)
@@ -2255,23 +2272,23 @@ class Trainer:
                             args, self.state, self.control, scaler=self.scaler if self.do_grad_scaling else None
                         )
 
-                        # 打印模型参数及参数梯度
-                        global_step = int(os.environ["TRAINER_GLOBAL_STEP"]) + 1
-                        rank_id = paddle.distributed.get_rank()
-                        step_rank = step_rank = "step" + str(global_step) + "_rank" + str(rank_id)
-                        if global_step == 1:
-                            for name, param in model.named_parameters():
-                                print(
-                                    f"[{step_rank}] param, {name}, md5: {param._md5sum()}, shape: {param.shape}, dtype: {param.dtype}"
-                                )
-                            for name, param in model.named_parameters():
-                                grad = getattr(param, "main_grad", param.grad)
-                                if grad is not None:
-                                    print(
-                                        f"[{step_rank}] param_grad, {name}, md5: {grad._md5sum()}, shape: {grad.shape}, dtype: {grad.dtype}, norm: {grad.norm(p='fro').item()}"
-                                    )
-                                else:
-                                    print(f"[{step_rank}] param_grad, {name}, grad is None")
+                        # # 打印模型参数及参数梯度
+                        # global_step = int(os.environ["TRAINER_GLOBAL_STEP"]) + 1
+                        # rank_id = paddle.distributed.get_rank()
+                        # step_rank = step_rank = "step" + str(global_step) + "_rank" + str(rank_id)
+                        # if global_step == 1:
+                        #     for name, param in model.named_parameters():
+                        #         print(
+                        #             f"[{step_rank}] param, {name}, md5: {param._md5sum()}, shape: {param.shape}, dtype: {param.dtype}"
+                        #         )
+                        #     for name, param in model.named_parameters():
+                        #         grad = getattr(param, "main_grad", param.grad)
+                        #         if grad is not None:
+                        #             print(
+                        #                 f"[{step_rank}] param_grad, {name}, md5: {grad._md5sum()}, shape: {grad.shape}, dtype: {grad.dtype}, norm: {grad.norm(p='fro').item()}"
+                        #             )
+                        #         else:
+                        #             print(f"[{step_rank}] param_grad, {name}, grad is None")
 
                         self.optimizer_step(args, model=model, parameters_list=parameters_list)
 
@@ -2289,6 +2306,15 @@ class Trainer:
                             * args.gradient_accumulation_steps
                             * args.dataset_world_size
                         )
+
+                        if self.state.global_step == 1 and self.args.logging_first_step:
+                            self.control.should_log = True
+                        if (
+                            self.args.logging_strategy == IntervalStrategy.STEPS
+                            and self.state.global_step % self.args.logging_steps == 0
+                        ):
+                            self.control.should_log = True
+
                         # For ZCC EMA
                         if self.args.enable_zero_cost_checkpoint or self.args.zcc_save_ema_coef is not None:
                             tr_loss_for_zcc = tr_loss.clone()
@@ -3629,6 +3655,28 @@ class Trainer:
         else:
             return False
 
+    # ------------------------------------------------------------------
+    # Helper: traverse LoRA / sharding wrappers to locate the criterion.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _find_criterion(model):
+        """Return the CriterionLayer inside a possibly-wrapped model, or None."""
+        inner = model
+        for attr in ("_layers", "model", "base_model", "_model"):
+            if hasattr(inner, attr):
+                inner = getattr(inner, attr)
+                break
+        # qwen3_omni_moe: thinker.criterion
+        for path in (("thinker", "criterion"), ("criterion",)):
+            obj = inner
+            for seg in path:
+                obj = getattr(obj, seg, None)
+                if obj is None:
+                    break
+            if obj is not None:
+                return obj
+        return None
+
     def training_step(
         self, model: nn.Layer, inputs: Dict[str, Union[paddle.Tensor, Any]], step_control=0
     ) -> paddle.Tensor:
@@ -3664,6 +3712,36 @@ class Trainer:
 
         model.train()
         inputs = self._prepare_inputs(inputs)
+
+        # # ----------------------------------------------------------------
+        # # Cross-accumulation-step num_items_in_batch normalization.
+        # # Mirrors the ms-swift / HF-Trainer behaviour where the loss
+        # # denominator is the total valid-token count across the whole
+        # # gradient-accumulation window (not just one micro-batch).
+        # #
+        # # Strategy: use the PREVIOUS window's total as the denominator for
+        # # the CURRENT window (1-window lag).  The first window falls back
+        # # to per-micro-batch normalization (criterion._num_items_in_batch=None).
+        # # ----------------------------------------------------------------
+        # _grad_acc = self.args.gradient_accumulation_steps
+        # if _grad_acc > 1 and not self._enable_delay_scale_loss():
+        #     if step_control == 0:
+        #         # Start of a new accumulation window: publish previous total
+        #         # and reset the current-window accumulator.
+        #         _prev_total = getattr(self, "_num_items_curr_window", None)
+        #         self._num_items_prev_window = _prev_total
+        #         self._num_items_curr_window = paddle.zeros([1], dtype="float32")
+
+        #     # Count valid tokens for this micro-batch.
+        #     if "labels" in inputs:
+        #         _valid = (inputs["labels"] != -100).astype("float32").sum()
+        #         self._num_items_curr_window = self._num_items_curr_window + _valid
+
+        #     # Set the denominator on the criterion so sft_postprocess_loss uses it.
+        #     _criterion = self._find_criterion(model)
+        #     if _criterion is not None:
+        #         _criterion._num_items_in_batch = getattr(self, "_num_items_prev_window", None)
+
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
@@ -3764,7 +3842,14 @@ class Trainer:
             signal_dir = self.args.output_signal_dir
 
         if ShardingOption.FULL_SHARD in self.args.sharding:
-            self.model_wrapped.get_all_parameters(convert2cpu=True, with_freeze_param=True)
+            try:
+                self.model_wrapped.get_all_parameters(convert2cpu=True, with_freeze_param=True)
+            except KeyError as e:
+                logger.warning(
+                    f"get_all_parameters with_freeze_param=True hit KeyError ({e}), "
+                    "retrying without frozen params (unsliced frozen params are already intact)."
+                )
+                self.model_wrapped.get_all_parameters(convert2cpu=True, with_freeze_param=False)
 
         if self.args.should_save_model_state:
             self._save(output_dir=output_dir, merge_tensor_parallel=merge_tensor_parallel, last_fc_to_hf=last_fc_to_hf)

@@ -59,6 +59,8 @@ from paddleformers.transformers import (
     AutoTokenizer,
     Llama3Tokenizer,
     LlamaTokenizer,
+    Qwen3OmniMoeThinkerConfig,
+    Qwen3OmniMoeThinkerForConditionalGeneration,
 )
 from paddleformers.transformers.configuration_utils import (
     LlmMetaConfig,
@@ -242,15 +244,15 @@ def run_sft(
         quantization_config = dict(weight_quantize_algo=finetuning_args.weight_quantize_algo)
     quantization_config = QuantizationConfig.from_dict(quantization_config)
 
-    model_config = AutoConfig.from_pretrained(
-        model_args.model_name_or_path,
-        dtype=dtype,
-        quantization_config=quantization_config,
-    )
-    # model_config = Qwen3OmniMoeThinkerConfig.from_pretrained(
+    # model_config = AutoConfig.from_pretrained(
     #     model_args.model_name_or_path,
     #     dtype=dtype,
+    #     quantization_config=quantization_config,
     # )
+    model_config = Qwen3OmniMoeThinkerConfig.from_pretrained(
+        model_args.model_name_or_path,
+        dtype=dtype,
+    )
 
     if (
         model_config.tie_word_embeddings
@@ -306,15 +308,28 @@ def run_sft(
     # Sync arguments to MLLM sub_config
     if getattr(model_config, "text_config", None) is not None:
         model_config.text_config.max_sequence_length = data_args.max_seq_len
-        model_config.vision_config._attn_implementation = model_args._attn_implementation
+        model_config.text_config._attn_implementation = model_args._attn_implementation
+        model_config.text_config.recompute_granularity = model_config.recompute_granularity
+        model_config.text_config.recompute_method = model_config.recompute_method
+        model_config.text_config.recompute_num_layers = model_config.recompute_num_layers
     if getattr(model_config, "vision_config", None) is not None:
         model_config.vision_config._attn_implementation = model_args._attn_implementation
         model_config.vision_config.recompute_granularity = model_config.recompute_granularity
         model_config.vision_config.recompute_method = model_config.recompute_method
         model_config.vision_config.recompute_num_layers = model_config.recompute_num_layers
     if getattr(model_config, "audio_config", None) is not None:
-        model_config.text_config.max_sequence_length = data_args.max_seq_len
-        model_config.vision_config._attn_implementation = model_args._attn_implementation
+        model_config.audio_config.max_sequence_length = data_args.max_seq_len
+        model_config.audio_config._attn_implementation = model_args._attn_implementation
+        model_config.audio_config.recompute_granularity = model_config.recompute_granularity
+        model_config.audio_config.recompute_method = model_config.recompute_method
+        model_config.audio_config.recompute_num_layers = model_config.recompute_num_layers
+
+    logger.info(
+        f"model_args._attn_implementation: {model_args._attn_implementation}\n"
+        f"model_config.text_config._attn_implementation: {model_config.text_config._attn_implementation}\n"
+        f"model_config.vision_config._attn_implementation: {model_config.vision_config._attn_implementation}\n"
+        f"model_config.audio_config._attn_implementation: {model_config.audio_config._attn_implementation}\n"
+    )
 
     # Sync freeze_config to model_config so that Fleet model providers can read it
     freeze_config = getattr(training_args, "freeze_config", "")
@@ -326,36 +341,36 @@ def run_sft(
     # logger.info(f"Final model config: {model_config}")
     logger.info("Creating model")
 
-    if "VL" in model_args.stage:
-        model_class = AutoModelForConditionalGeneration
-        if training_args.pipeline_model_parallel_size > 1:
-            if data_args.eval_with_do_generation and training_args.do_eval:
-                raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
-            model_class = AutoModelForConditionalGenerationPipe
-    else:
-        model_class = AutoModelForCausalLM
-        if training_args.pipeline_model_parallel_size > 1:
-            if data_args.eval_with_do_generation and training_args.do_eval:
-                raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
-            model_class = AutoModelForCausalLMPipe
+    # if "VL" in model_args.stage:
+    #     model_class = AutoModelForConditionalGeneration
+    #     if training_args.pipeline_model_parallel_size > 1:
+    #         if data_args.eval_with_do_generation and training_args.do_eval:
+    #             raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
+    #         model_class = AutoModelForConditionalGenerationPipe
+    # else:
+    #     model_class = AutoModelForCausalLM
+    #     if training_args.pipeline_model_parallel_size > 1:
+    #         if data_args.eval_with_do_generation and training_args.do_eval:
+    #             raise ValueError("Please set eval_with_do_generation to false in pipeline parallel mode.")
+    #         model_class = AutoModelForCausalLMPipe
 
-    if model_args.continue_training and not training_args.autotuner_benchmark:
-        model = model_class.from_pretrained(
-            model_args.model_name_or_path,
-            config=model_config,
-            convert_from_hf=training_args.convert_from_hf,
-            load_via_cpu=training_args.load_via_cpu,
-            load_checkpoint_format=training_args.load_checkpoint_format,
-        )
-    else:
-        model = model_class.from_config(model_config, dtype=dtype)
+    # if model_args.continue_training and not training_args.autotuner_benchmark:
+    #     model = model_class.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         config=model_config,
+    #         convert_from_hf=training_args.convert_from_hf,
+    #         load_via_cpu=training_args.load_via_cpu,
+    #         load_checkpoint_format=training_args.load_checkpoint_format,
+    #     )
+    # else:
+    #     model = model_class.from_config(model_config, dtype=dtype)
 
-    # model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
-    #     model_args.model_name_or_path,
-    #     config=model_config,
-    #     load_checkpoint_format=training_args.load_checkpoint_format,
-    #     dtype=dtype,
-    # )
+    model = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+        model_args.model_name_or_path,
+        config=model_config,
+        load_checkpoint_format=training_args.load_checkpoint_format,
+        dtype=dtype,
+    )
 
     if training_args.do_train and model_args.neftune:
         # Inspired by https://github.com/neelsjain/NEFTune
@@ -750,10 +765,25 @@ def create_peft_model(model_args, training_args, dtype, model):
             if getattr(training_args, "freeze_config", ""):
                 target_modules = get_multimodel_lora_target_modules(model, target_modules, training_args.freeze_config)
 
+            # Use model_args.lora_alpha if explicitly set (>0), otherwise fall back to 2*rank
+            _lora_alpha = (
+                model_args.lora_alpha
+                if model_args.lora_alpha > 0
+                else 2 * model_args.lora_rank
+            )
+            if not model_args.rslora:
+                effective_lora_alpha = _lora_alpha
+            else:
+                effective_lora_alpha = 4
+            logger.info(
+                f"LoRA config: rank={model_args.lora_rank}, alpha={effective_lora_alpha} "
+                f"(model_args.lora_alpha={model_args.lora_alpha}), "
+                f"scale={effective_lora_alpha / model_args.lora_rank:.2f}"
+            )
             lora_config = LoRAConfig(
                 target_modules=target_modules,
                 r=model_args.lora_rank,
-                lora_alpha=2 * model_args.lora_rank if not model_args.rslora else 4,
+                lora_alpha=effective_lora_alpha,
                 rslora=model_args.rslora,
                 lora_plus_scale=model_args.lora_plus_scale,
                 merge_weights=False,
@@ -770,6 +800,29 @@ def create_peft_model(model_args, training_args, dtype, model):
             )
         if hasattr(model, "_set_pipeline_name_mapping"):
             model._set_pipeline_name_mapping()
+
+        print("print_trainable_parameters!")
         model.print_trainable_parameters()
+
+        # Log all LoRA-applied base layer names (grouped by component) for comparison
+        # with other frameworks (e.g., ms-swift --target_modules all-linear).
+        lora_base_names = sorted(set(
+            name.replace(".lora_A", "").replace(".lora_B", "")
+                .replace(".lora_dropout", "").replace(".base_layer", "")
+            for name, param in model.named_parameters()
+            if "lora_A" in name
+        ))
+        _groups = {}
+        for n in lora_base_names:
+            # derive component key from first two meaningful path segments
+            parts = n.lstrip("_").split(".")
+            key = ".".join(parts[:3]) if len(parts) >= 3 else n
+            _groups.setdefault(key, []).append(n)
+        log_lines = [f"LoRA applied to {len(lora_base_names)} base layers (grouped):"]
+        for grp_key in sorted(_groups):
+            log_lines.append(f"  [{grp_key}]  ({len(_groups[grp_key])} layers)")
+            for n in _groups[grp_key]:
+                log_lines.append(f"    {n}")
+        logger.info("\n".join(log_lines))
 
     return model

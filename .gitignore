@@ -170,8 +170,10 @@ ops/csrc/fp8/deep_gemm/include/cute
 # logs and running results
 paddleformers_dist_log
 checkpoints
-log-pdformers
+log-pdformers*
 saved_inputs
 saved_tensors
 configs
 core.*
+index.html
+**/index.html

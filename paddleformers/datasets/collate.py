@@ -625,7 +625,7 @@ def mm_collate_fn(
             if get_rope_func is not None:
                 filtered_args = {k: paddle.to_tensor(mm_inputs[k]) for k in func_params if k in mm_inputs}
                 attn_mask = gen_self_attn_mask(
-                    original_token_ids, len(seq.token_ids), model_args.use_global_causal_attn
+                    original_token_ids, sum(len(t) for t in original_token_ids), model_args.use_global_causal_attn
                 )
                 filtered_args["attention_mask"] = paddle.to_tensor(attn_mask[0, 0, -1:, :])
                 if "video_second_per_grid" in mm_inputs:

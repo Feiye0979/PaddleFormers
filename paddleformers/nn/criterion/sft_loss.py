@@ -47,6 +47,16 @@ def sft_postprocess_loss(self, masked_lm_loss, labels, loss_mask, **kwargs):
     loss_mask = loss_mask.reshape([-1]).cast(paddle.float32)
     # 逐位对齐, 全精度聚合
     masked_lm_loss = paddle.sum(masked_lm_loss.cast(paddle.float32).reshape([-1]) * loss_mask)
+
+    # # Use cross-accumulation-step token count if the trainer has set it,
+    # # otherwise fall back to local micro-batch token count.
+    # # This matches the ms-swift / HF-Trainer num_items_in_batch normalization.
+    # num_items_in_batch = getattr(self, "_num_items_in_batch", None)
+    # if num_items_in_batch is not None and num_items_in_batch > 0:
+    #     loss = masked_lm_loss / num_items_in_batch.cast(masked_lm_loss.dtype)
+    # else:
+    #     loss = masked_lm_loss / loss_mask.sum()
+
     loss = masked_lm_loss / loss_mask.sum()
     loss_sum = masked_lm_loss.sum().detach()
 

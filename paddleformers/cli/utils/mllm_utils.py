@@ -21,7 +21,8 @@ from typing import Dict, List, Optional, Union
 from paddleformers.utils.log import logger
 
 _MULTIMODEL_KEY_REGISTRY: Dict[str, MultiModelKeys] = {}
-_ALL_MODULES = ["vision", "aligner", "llm"]
+_ALL_MODULES = ["vision", "aligner", "llm", "generator"]
+_FREEZE_MODULES = ["generator"]
 
 
 class MLLMModelMapping:
@@ -31,6 +32,8 @@ class MLLMModelMapping:
     paddleocr_vl = "paddleocr_vl"
     ernie4_5_moe_vl = "ernie4_5_moe_vl"
     glm4v_moe = "glm4v_moe"
+    qwen3_omni_moe = "qwen3_omni_moe"
+    qwen3_omni_moe_thinker = "qwen3_omni_moe_thinker"
 
 
 @dataclass
@@ -53,9 +56,10 @@ class MultiModelKeys(ModelKeys):
     llm: Union[str, List[str]] = field(default_factory=list)
     aligner: Union[str, List[str]] = field(default_factory=list)
     vision: Union[str, List[str]] = field(default_factory=list)
+    generator: Union[str, List[str]] = field(default_factory=list)
 
     def __post_init__(self):
-        for key in ["llm", "aligner", "vision"]:
+        for key in ["llm", "aligner", "vision", "generator"]:
             v = getattr(self, key)
             if isinstance(v, str):
                 setattr(self, key, [v])
@@ -79,6 +83,7 @@ def get_multimodel_target_modules(model_type: Optional[str]) -> Optional[Union[M
 def get_multimodel_lora_target_modules(model, target_modules, freeze_config):
 
     model_type = model.config.model_type
+    logger.info(f"get_multimodel_lora_target_modules model_type: {model_type}")
 
     multimodel_keys = get_multimodel_target_modules(model_type)
     if not multimodel_keys:
@@ -100,7 +105,7 @@ def get_multimodel_lora_target_modules(model, target_modules, freeze_config):
             prefix_to_module[p] = module
 
     sorted_prefixes = sorted(prefix_to_module.keys(), key=len, reverse=True)
-    active_freeze_config = {m for m in _ALL_MODULES if f"freeze_{m}" in freeze_config}
+    active_freeze_config = {m for m in _ALL_MODULES if f"freeze_{m}" in freeze_config or m in _FREEZE_MODULES}
 
     multimodel_target_modules = []
     removed_info = defaultdict(list)
@@ -155,7 +160,7 @@ def freeze_model_parameters(model, freeze_config):
             prefix_to_module[p] = module
 
     sorted_prefixes = sorted(prefix_to_module.keys(), key=len, reverse=True)
-    active_freeze_config = {m for m in _ALL_MODULES if f"freeze_{m}" in freeze_config}
+    active_freeze_config = {m for m in _ALL_MODULES if f"freeze_{m}" in freeze_config or m in _FREEZE_MODULES}
     full_pattern = re.compile("^(" + "|".join(re.escape(p) for p in sorted_prefixes) + ")")
 
     frozen_keys = defaultdict(list)
@@ -236,5 +241,30 @@ register_multimodel_keys(
         aligner="model.visual.merger",
         llm=["model.language_model", "lm_head"],
         vision="model.visual",
+    )
+)
+
+register_multimodel_keys(
+    MultiModelKeys(
+        model_dtype=MLLMModelMapping.qwen3_omni_moe,
+        aligner=[
+            "thinker.visual.merger", "thinker.visual.merger_list", 
+            "thinker.audio_tower.proj1", "thinker.audio_tower.proj2"
+        ],
+        llm=["thinker.model", "thinker.lm_head"],
+        vision=["thinker.visual", "thinker.audio_tower"],
+        generator=["talker", "code2wav"]
+    )
+)
+
+register_multimodel_keys(
+    MultiModelKeys(
+        model_dtype=MLLMModelMapping.qwen3_omni_moe_thinker,
+        aligner=[
+            "visual.merger", "visual.merger_list", 
+            "audio_tower.proj1", "audio_tower.proj2"
+        ],
+        llm=["model", "lm_head"],
+        vision=["visual", "audio_tower"],
     )
 )

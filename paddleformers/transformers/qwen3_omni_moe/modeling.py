@@ -26,6 +26,7 @@ from paddle import nn
 from paddle.distributed.flex_checkpoint.dcp.sharded_weight import (
     build_sharded_state_dict,
 )
+from paddle.distributed.fleet.utils import recompute
 from paddle.nn import functional as F
 
 from ...generation import GenerationMixin
@@ -69,9 +70,13 @@ HACK_FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-sw
 run_online = True
 mock_switch = False
 
+print_names = [
+    "0_input_ids"
+]
 
 def compare_and_save(data, name: str, to_save: bool = False, print_tensor: bool = False):
     if run_online:
+        # print(name, type(data), data.shape if data is not None else None)
         return
     if print_tensor:
         print(name, type(data), data.shape if data is not None else None, data)
@@ -93,7 +98,7 @@ def compare_and_save(data, name: str, to_save: bool = False, print_tensor: bool 
         print(
             f"{name} md5: {data_md5}, dtype: {data.dtype}, shape: {data.shape if data is not None else None}, device: {data.device}"
         )
-        if to_save:
+        if to_save and not run_online:
             os.makedirs(FILE_DIR, exist_ok=True)
             file = FILE_DIR + name + ".npy"
             np.save(file, data_np)
@@ -1009,6 +1014,10 @@ class Qwen3OmniMoePreTrainedModelForConditionalGeneration(Qwen3OmniMoePreTrained
                 position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
                 mrope_position_deltas.append(llm_positions.max() + 1 - len(input_ids))
             mrope_position_deltas = paddle.tensor(mrope_position_deltas, device=input_ids.device).unsqueeze(1)
+            # mrope_position_deltas = mrope_position_deltas.clone().detach().to(device=input_ids.device).unsqueeze(1)
+            # mrope_position_deltas = (
+            #     paddle.stack([d.reshape([]) for d in mrope_position_deltas]).to(device=input_ids.device).unsqueeze(1)
+            # )
 
             return position_ids, mrope_position_deltas
         else:
@@ -1321,6 +1330,19 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
     _no_split_modules = ["Qwen3OmniMoeAudioEncoderLayer"]
     _supports_sdpa = True
 
+    def recompute_training_full(self, encoder_layer, hidden_states, cu_seqlens, layer_idx):
+        def create_custom_forward(module, layer_idx):
+            def custom_forward(*inputs):
+                return module(*inputs, layer_idx=layer_idx)
+            return custom_forward
+
+        outputs = recompute(
+            create_custom_forward(encoder_layer, layer_idx),
+            hidden_states,
+            cu_seqlens,
+        )
+        return outputs
+
     def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig):
         super().__init__(config)
         self.config = config
@@ -1545,15 +1567,26 @@ class Qwen3OmniMoeAudioEncoder(Qwen3OmniMoePreTrainedModel):
                 cu_chunk_lens += [remainder]
         cu_seqlens = paddle.tensor(cu_chunk_lens, device=aftercnn_lens.device).cumsum(-1, dtype=paddle.int32)
 
-        print("window_aftercnn: ", window_aftercnn)
+        # print("window_aftercnn: ", window_aftercnn)
         compare_and_save(cu_seqlens, "cu_seqlens_before_layers", True, False)
 
         for layer_idx, encoder_layer in enumerate(self.layers):
-            layer_outputs = encoder_layer(
-                hidden_states,
-                cu_seqlens,
-                layer_idx,
-            )
+            has_gradient = not hidden_states.stop_gradient
+            if (
+                getattr(self.config, "recompute_granularity", None) == "full"
+                and getattr(self.config, "recompute_method", None) == "uniform"
+                and getattr(self.config, "recompute_num_layers", None) == 1
+                and has_gradient
+            ):
+                layer_outputs = self.recompute_training_full(
+                    encoder_layer, hidden_states, cu_seqlens, layer_idx
+                )
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                    cu_seqlens,
+                    layer_idx,
+                )
 
             hidden_states = layer_outputs[0]
 
@@ -2016,6 +2049,18 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
     config_class = Qwen3OmniMoeVisionEncoderConfig
     _no_split_modules = ["Qwen3OmniMoeVisionBlock"]
 
+    def recompute_training_full(self, blk, hidden_states, layer_num, cu_seqlens, position_embeddings):
+        def create_custom_forward(module, layer_num, position_embeddings):
+            def custom_forward(hidden_states, cu_seqlens):
+                return module(hidden_states, layer_num, cu_seqlens, position_embeddings=position_embeddings)
+            return custom_forward
+
+        return recompute(
+            create_custom_forward(blk, layer_num, position_embeddings),
+            hidden_states,
+            cu_seqlens,
+        )
+
     def __init__(self, config, *inputs, **kwargs) -> None:
         super().__init__(config, *inputs, **kwargs)
         self.merger_list = nn.LayerList(
@@ -2123,9 +2168,11 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
     #     embeddings = embeddings.flatten(1)
     #     return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw):
+    def fast_pos_embed_interpolate(self, grid_thw, dtype=None):
         grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
-        device = self.pos_embed.weight.device
+        device = grid_thw.place
+        if dtype is None:
+            dtype = paddle.get_default_dtype()
 
         idx_list = [[] for _ in range(4)]
         weight_list = [[] for _ in range(4)]
@@ -2164,7 +2211,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = paddle.tensor(idx_list, dtype=paddle.long, device=device)
-        weight_tensor = paddle.tensor(weight_list, dtype=self.pos_embed.weight.dtype, device=device)
+        weight_tensor = paddle.tensor(weight_list, dtype=dtype, device=device)
         pos_embeds = self.pos_embed(idx_tensor).to(device) * weight_tensor[:, :, None]
         patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
@@ -2202,7 +2249,7 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
 
         compare_and_save(hidden_states, "hidden_states_in_vision_encoder_after_patched_embed", True, False)
 
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        pos_embeds = self.fast_pos_embed_interpolate(grid_thw, dtype=hidden_states.dtype)
         hidden_states = hidden_states + pos_embeds
 
         compare_and_save(hidden_states, "hidden_states_in_vision_encoder_after_pos_embeds", True, False)
@@ -2250,13 +2297,24 @@ class Qwen3OmniMoeVisionEncoder(Qwen3OmniMoePreTrainedModel):
 
             compare_and_save(hidden_states, f"hidden_states_in_vision_encoder_before_layer_{layer_num}", True, False)
 
-            hidden_states = blk(
-                hidden_states,
-                layer_num,
-                cu_seqlens=cu_seqlens,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+            has_gradient = not hidden_states.stop_gradient
+            if (
+                getattr(self.config, "recompute_granularity", None) == "full"
+                and getattr(self.config, "recompute_method", None) == "uniform"
+                and getattr(self.config, "recompute_num_layers", None) == 1
+                and has_gradient
+            ):
+                hidden_states = self.recompute_training_full(
+                    blk, hidden_states, layer_num, cu_seqlens, position_embeddings
+                )
+            else:
+                hidden_states = blk(
+                    hidden_states,
+                    layer_num,
+                    cu_seqlens=cu_seqlens,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
             if layer_num in self.deepstack_visual_indexes:
                 deepstack_feature = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_num)](
                     hidden_states
@@ -2293,14 +2351,14 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Layer):
 
         rope_parameters = config.rope_parameters
         self.rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
-        print(
-            "In ",
-            __class__.__name__,
-            ".__init__, ",
-            type(config.rope_parameters),
-            config.rope_parameters,
-            self.rope_type,
-        )
+        # print(
+        #     "In ",
+        #     __class__.__name__,
+        #     ".__init__, ",
+        #     type(config.rope_parameters),
+        #     config.rope_parameters,
+        #     self.rope_type,
+        # )
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
             rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
@@ -2350,7 +2408,7 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Layer):
             inv_freq = 1.0 / (
                 base ** (paddle.arange(0, dim, 2, dtype=paddle.int64).astype(dtype=paddle.float).to(device) / dim)
             )
-        print("Qwen3OmniMoeThinkerTextRotaryEmbedding inv_freq", inv_freq)
+        # print("Qwen3OmniMoeThinkerTextRotaryEmbedding inv_freq", inv_freq)
         compare_and_save(inv_freq, "inv_freq_in_init", True, False)
         inv_freq = inv_freq.cuda()
         return inv_freq, attention_factor
@@ -2988,6 +3046,36 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         "^thinker.model": "model",
     }
 
+    @paddle.jit.not_to_static
+    def recompute_training_full(
+        self,
+        layer_module: nn.Layer,
+        hidden_states: paddle.Tensor,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        cache_position=None,
+        position_embeddings=None,
+        **kwargs,
+    ):
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(*inputs)
+
+            return custom_forward
+
+        hidden_states = recompute(
+            create_custom_forward(layer_module),
+            hidden_states,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            False,  # use_cache must be False during recompute
+            cache_position,
+            position_embeddings,
+        )
+        return hidden_states
+
     def __init__(self, config: Qwen3OmniMoeTextConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -3057,6 +3145,13 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
             batch_size, seq_length, _ = inputs_embeds.shape
         else:
             raise ValueError("You have to specify either decoder_input_ids or decoder_inputs_embeds")
+        
+        if self.config.recompute_granularity == "full" and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
@@ -3128,15 +3223,33 @@ class Qwen3OmniMoeThinkerTextModel(Qwen3OmniMoePreTrainedModel):
         for layer_idx, decoder_layer in enumerate(self.layers):
             compare_and_save(hidden_states, f"hidden_states_before_layer_{layer_idx}", True, False)
 
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=text_position_ids,
-                past_key_values=past_key_values,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
-                **kwargs,
-            )
+            has_gradient = not hidden_states.stop_gradient
+            if (
+                getattr(self.config, "recompute_granularity", None) == "full"
+                and getattr(self.config, "recompute_method", None) == "uniform"
+                and getattr(self.config, "recompute_num_layers", None) == 1
+                and has_gradient
+            ):
+                layer_outputs = self.recompute_training_full(
+                    decoder_layer,
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=text_position_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=text_position_ids,
+                    past_key_values=past_key_values,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
 
             hidden_states = layer_outputs
 
@@ -3490,7 +3603,7 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(
             embeds_dtype = embed_tokens.weight.dtype
             compare_and_save(input_ids, "input_ids_at_first", True, False)
             compare_and_save(embed_tokens.weight, "embed_tokens_weight_at_first", True, False)
-            print("embed_tokens.weight actual dtype:", embed_tokens.weight.dtype)
+            # print("embed_tokens.weight actual dtype:", embed_tokens.weight.dtype)
             # 1. Extract the input embeddings
             if mock_by_torch_file_embedding:
                 inputs_embeds = hack_with_torch_file("inputs_embeds_at_first", embeds_dtype, input_ids.device)
@@ -3952,9 +4065,9 @@ class Qwen3OmniMoeRotaryEmbedding(nn.Layer):
 
         self.config = config
 
-        print("In ", __class__.__name__, ".__init__, ", type(config), config)
+        # print("In ", __class__.__name__, ".__init__, ", type(config), config)
         rope_parameters = config.rope_parameters
-        print("In ", __class__.__name__, ".__init__, ", type(rope_parameters), rope_parameters)
+        # print("In ", __class__.__name__, ".__init__, ", type(rope_parameters), rope_parameters)
         self.rope_type = rope_parameters.get("rope_type", rope_parameters.get("type", "default"))
         rope_init_fn: Callable = self.compute_default_rope_parameters
         if self.rope_type != "default":
