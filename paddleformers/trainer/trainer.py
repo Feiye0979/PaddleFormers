@@ -1756,8 +1756,18 @@ class Trainer:
             self._reload_optimizer()
 
         # Compute grad_norm for Sharding Stage3 (not covered by HybridParallelOptimizer path)
+        # For HybridParallelOptimizer, only apply when mp=1 and pp=1 (pure sharding, no tensor/pipeline parallel),
+        # otherwise all_reduce would double-count gradients that are tensor-parallel partitioned.
+        # In pure sharding (mp=1, pp=1), each rank holds non-overlapping parameters so all_reduce is correct.
+        _is_pure_sharding = (
+            args.tensor_model_parallel_size <= 1
+            and args.pipeline_model_parallel_size <= 1
+        )
         if (
-            not isinstance(self.optimizer, HybridParallelOptimizer)
+            (
+                not isinstance(self.optimizer, HybridParallelOptimizer)
+                or _is_pure_sharding
+            )
             and (
                 ShardingOption.FULL_SHARD in args.sharding
                 or ShardingOption.SHARD_GRAD_OP in args.sharding
@@ -1770,6 +1780,24 @@ class Trainer:
                 if grad is not None:
                     _sq_sum += (grad.astype("float32") ** 2).sum()
             dist.all_reduce(_sq_sum, op=dist.ReduceOp.SUM)
+            # When reduce-scatter happens inside optimizer.step() (not during backward),
+            # each rank holds the FULL gradient at this point, so all_reduce SUM gives
+            # sharding_degree * ||g||^2. Divide to get the correct ||g||^2.
+            # Cases where each rank has the FULL gradient:
+            #   - stage3 (FULL_SHARD): reduce-scatter always inside optimizer
+            #   - stage2 (SHARD_GRAD_OP) without overlap: same
+            # Exception: stage2 with stage2_overlap=True does reduce-scatter during
+            # backward (bucket hooks), so each rank already has only its gradient shard,
+            # and the all_reduce SUM above is already correct — no correction needed.
+            _grad_full_on_each_rank = (
+                ShardingOption.FULL_SHARD in args.sharding
+                or (
+                    ShardingOption.SHARD_GRAD_OP in args.sharding
+                    and not args.stage2_overlap
+                )
+            )
+            if _grad_full_on_each_rank:
+                _sq_sum = _sq_sum / args.sharding_parallel_size
             self.global_training_logs["global_norm"] = float(_sq_sum.sqrt().item())
 
         if self.do_grad_scaling:
@@ -3641,7 +3669,7 @@ class Trainer:
             loss = loss[0]  # hack for some problem in modeling
 
         compare_and_save(outputs["logits"], "output_ids_logits_after_forward", True, False)
-        compare_and_save(loss, "output_ids_loss_after_forward", True, False)
+        compare_and_save(loss, "output_ids_loss_after_forward", True, True)
         return (loss, outputs) if return_outputs else loss
 
     def _enable_delay_scale_loss(self):
@@ -3660,13 +3688,32 @@ class Trainer:
     # ------------------------------------------------------------------
     @staticmethod
     def _find_criterion(model):
-        """Return the CriterionLayer inside a possibly-wrapped model, or None."""
+        """Return the CriterionLayer inside a possibly-wrapped model, or None.
+
+        Unwraps sharding / DDP / LoRA wrapper layers iteratively until the
+        raw model is reached, then walks known attribute paths to the criterion.
+        """
+        # Iteratively unwrap wrapper layers (sharding, DDP, LoRA, fleet, etc.)
         inner = model
-        for attr in ("_layers", "model", "base_model", "_model"):
-            if hasattr(inner, attr):
-                inner = getattr(inner, attr)
+        for _ in range(8):  # at most 8 levels deep
+            unwrapped = None
+            for attr in ("_layers", "model", "base_model", "_model"):
+                if hasattr(inner, attr):
+                    candidate = getattr(inner, attr)
+                    # Stop if candidate looks like the real model (has 'config' or 'training')
+                    # and is not another wrapper of the same type.
+                    if candidate is not None and candidate is not inner:
+                        unwrapped = candidate
+                        break
+            if unwrapped is None:
                 break
-        # qwen3_omni_moe: thinker.criterion
+            inner = unwrapped
+            # Early-exit: if inner already exposes thinker or criterion, stop unwrapping
+            if hasattr(inner, "thinker") or hasattr(inner, "criterion"):
+                break
+
+        # Try known attribute paths to reach the CriterionLayer
+        # qwen3_omni_moe: model.thinker.criterion
         for path in (("thinker", "criterion"), ("criterion",)):
             obj = inner
             for seg in path:
@@ -3713,6 +3760,71 @@ class Trainer:
         model.train()
         inputs = self._prepare_inputs(inputs)
 
+
+        # ==================================================================
+        # Dump inputs by ms-swift
+        if self.state.global_step < 10:
+            print("============\nstep ", self.state.global_step, " inputs: ")
+            print(inputs)
+            print("============\n")
+        import copy
+        import numpy as np
+        dump_flag = os.getenv("FLAGS_dump_inputs_version", "").lower()
+        if dump_flag is not None and dump_flag != "":
+            dump_inputs_files = os.getenv(
+                "FLAGS_dump_inputs_fields",
+                "input_ids, labels, position_ids, image_grid_thw, pixel_values, input_features"
+            )
+            dump_inputs_path = os.path.join(
+                os.getenv("FLAGS_dump_inputs_path", "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-swift/saved_inputs/npy/"),
+                dump_flag
+            )
+    
+            if os.path.exists(dump_inputs_path):
+                fields_to_dump = [f.strip() for f in dump_inputs_files.split(",")]
+
+                dump_confirm = True
+                origin_inputs = copy.deepcopy(inputs)
+                for field in fields_to_dump:
+                    if field in inputs and inputs[field] is not None:
+                        field_file = os.path.join(dump_inputs_path, f"{self.state.global_step}_{field}.npy")
+                        if os.path.exists(field_file):
+                            field_npy = np.load(field_file)
+
+                            if field == "labels":
+                                labels = paddle.to_tensor(
+                                    field_npy, dtype=inputs[field].dtype
+                                ).to(inputs[field].device)
+                                suffix = paddle.full([labels.shape[0], 1], -100, dtype=labels.dtype)
+                                labels = paddle.concat([labels[:, 1:], suffix], axis=1)
+                                inputs[field] = labels
+                            else:
+                                inputs[field] = paddle.to_tensor(
+                                    field_npy, dtype=inputs[field].dtype
+                                ).to(inputs[field].device)
+                                
+                        else:
+                            dump_confirm = False
+                            print("field_file: ", field_file, " needed but not found. abort dumping.")
+                
+                if not dump_confirm:
+                    print("withdraw dump in step ", self.state.global_step)
+                    inputs = copy.deepcopy(origin_inputs)
+                else:
+                    print("dump inputs in step ", self.state.global_step)
+                    # # attention_mask was pre-computed for the original seq_len;
+                    # # remove it so the model recomputes it from the new input_ids.
+                    # inputs.pop("attention_mask", None)
+            else:
+                print("dump_inputs_path: ", dump_inputs_path, " not found. abort dumping.")
+
+
+        if self.state.global_step < 10:
+            print("============\nstep ", self.state.global_step, " after dump inputs: ")
+            print(inputs)
+            print("")
+            print("============\n")
+
         # # ----------------------------------------------------------------
         # # Cross-accumulation-step num_items_in_batch normalization.
         # # Mirrors the ms-swift / HF-Trainer behaviour where the loss
@@ -3742,11 +3854,106 @@ class Trainer:
         #     if _criterion is not None:
         #         _criterion._num_items_in_batch = getattr(self, "_num_items_prev_window", None)
 
+        # ----------------------------------------------------------------
+        # [INPUT_DEBUG] Print input_ids / labels for the first few global steps.
+        # Only fires on rank-0 and only at the first micro-batch of each step
+        # (step_control == 0) to avoid flooding the log.
+        _input_debug_steps = 3   # change this to print more steps
+        if step_control == 0 and self.state.global_step < _input_debug_steps:
+            _rank = paddle.distributed.get_rank() if paddle.distributed.is_initialized() else 0
+            if _rank == 0:
+                _iids = inputs.get("input_ids", None)
+                _lbls = inputs.get("labels", None)
+                _attn = inputs.get("attention_mask", None)
+                _gs   = self.state.global_step
+                print(f"\n[INPUT_DEBUG PF step={_gs} rank={_rank}]")
+                if _iids is not None:
+                    print(f"  input_ids  shape : {list(_iids.shape)}")
+                    print(f"  input_ids  [0,:30]: {_iids[0, :30].tolist()}")
+                    print(f"  input_ids  [0,-10:]: {_iids[0, -10:].tolist()}")
+                if _lbls is not None:
+                    print(f"  labels     shape : {list(_lbls.shape)}")
+                    print(f"  labels     [0,:30]: {_lbls[0, :30].tolist()}")
+                    print(f"  valid_tok  per sample: {[int((_lbls[i] != -100).sum()) for i in range(min(_lbls.shape[0], 4))]}")
+                    print(f"  valid_tok  total : {int((_lbls != -100).sum())}")
+                if _attn is not None:
+                    print(f"  attn_mask  sum   : {int(_attn.sum())}")
+                    
+        # # ----------------------------------------------------------------
+        # # Fix-4 (active): cross-accumulation-step num_items_in_batch normalization.
+        # # Uses the PREVIOUS window's total valid-token count as the denominator for
+        # # the CURRENT window (1-window lag).  First window falls back to the
+        # # original per-micro-batch mean (criterion._num_items_in_batch = None).
+        # #
+        # # IMPORTANT: when this normalization is active the loss already encodes the
+        # # full /total_accum_tokens scaling, so the usual /gradient_accumulation_steps
+        # # division below is SKIPPED — otherwise we would divide twice.
+        # # This matches ms-swift / HF-Trainer (transformers ≥ 4.46) which also skips
+        # # /gradient_accumulation_steps when model_accepts_loss_kwargs=True.
+        # # ----------------------------------------------------------------
+        # _grad_acc = self.args.gradient_accumulation_steps
+        # if _grad_acc > 1 and not self._enable_delay_scale_loss():
+        #     if step_control == 0:
+        #         _prev_total = getattr(self, "_num_items_curr_window", None)
+        #         self._num_items_prev_window = _prev_total
+        #         self._num_items_curr_window = paddle.zeros([1], dtype="float32")
+        #         # [Fix-4 debug] print model wrapper chain once at the start of each window
+        #         if not getattr(self, "_fix4_debug_printed", False):
+        #             self._fix4_debug_printed = True
+        #             _dbg = model
+        #             _chain = []
+        #             for _ in range(10):
+        #                 _chain.append(type(_dbg).__name__)
+        #                 _next = None
+        #                 for _a in ("_layers", "model", "base_model", "_model"):
+        #                     if hasattr(_dbg, _a):
+        #                         _next = getattr(_dbg, _a)
+        #                         _chain.append(f".{_a}")
+        #                         break
+        #                 if _next is None or _next is _dbg:
+        #                     break
+        #                 _dbg = _next
+        #             print("[Fix-4 debug] model chain:", " -> ".join(_chain))
+        #             print("[Fix-4 debug] _find_criterion(model):", self._find_criterion(model))
+        #             print("[Fix-4 debug] _find_criterion(self.model):", self._find_criterion(self.model))
+        #             print("[Fix-4 debug] _enable_delay_scale_loss:", self._enable_delay_scale_loss())
+        #             print("[Fix-4 debug] grad_acc:", _grad_acc)
+
+        #     if "labels" in inputs:
+        #         _valid = (inputs["labels"] != -100).astype("float32").sum()
+        #         self._num_items_curr_window = self._num_items_curr_window + _valid
+
+        #     # Cache the CriterionLayer reference on first call.
+        #     # The model arg to training_step is the sharding-wrapped INNER model
+        #     # (GroupShardedStage2(ThinkerTextModel)), which does NOT contain criterion.
+        #     # The criterion lives in the outer model accessible via self.model
+        #     # (LoRAModel -> Qwen3OmniMoeForConditionalGeneration -> thinker.criterion).
+        #     if not hasattr(self, "_cached_criterion"):
+        #         self._cached_criterion = (
+        #             self._find_criterion(model) or self._find_criterion(self.model)
+        #         )
+        #     _criterion = self._cached_criterion
+        #     if _criterion is not None:
+        #         _criterion._num_items_in_batch = getattr(self, "_num_items_prev_window", None)
+
         with self.autocast_smart_context_manager():
             loss = self.compute_loss(model, inputs)
 
+        # ---- Original: always divide by gradient_accumulation_steps ----
         if self.args.gradient_accumulation_steps > 1 and not self._enable_delay_scale_loss():
             loss = loss / self.args.gradient_accumulation_steps
+
+        # # ---- Fix-4: skip /grad_accum when cross-step normalization is active ----
+        # # When _num_items_in_batch is set the loss denominator already covers the
+        # # whole accumulation window, so dividing again would shrink gradients by 4×.
+        # _criterion_for_check = getattr(self, "_cached_criterion", None) or self._find_criterion(model)
+        # _cross_step_norm_active = (
+        #     _criterion_for_check is not None
+        #     and getattr(_criterion_for_check, "_num_items_in_batch", None) is not None
+        # )
+        # if not _cross_step_norm_active:
+        #     if self.args.gradient_accumulation_steps > 1 and not self._enable_delay_scale_loss():
+        #         loss = loss / self.args.gradient_accumulation_steps
 
         if self.do_grad_scaling:
             self.scaler.scale(loss).backward()

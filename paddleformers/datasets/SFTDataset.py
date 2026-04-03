@@ -707,6 +707,7 @@ class SFTDataSet(IterableDataset):
                 if images or videos or audios:
                     # If there is multimodal data, do not truncate it; just discard it directly.
                     sub_src = example["messages"][0]["content"].strip()[:50]
+                    logger.info(f"[SKIP] Current max_seq_len: {self.max_seq_len}, remaining_len: {remaining_len}, len(tokens_src): {len(tokens_src)}, len(tokens_target): {len(tokens_target)}")
                     logger.warning(f"[SKIP] This data is too long: {sub_src}...")
                     return None
                 # If the source (src) exceeds length limit, discard this round of conversation data

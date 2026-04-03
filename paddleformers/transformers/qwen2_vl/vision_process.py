@@ -35,16 +35,16 @@ from ...utils.log import logger
 from ..paddle_vision_utils import resize as paddle_resize
 
 MAX_RATIO = 200
-SPATIAL_MERGE_SIZE = 2
-IMAGE_MIN_TOKEN_NUM = 4
-IMAGE_MAX_TOKEN_NUM = 16384
-VIDEO_MIN_TOKEN_NUM = 128
-VIDEO_MAX_TOKEN_NUM = 768
+SPATIAL_MERGE_SIZE = int(float(os.environ.get("IMAGE_MIN_TOKEN_NUM", 2)))
+IMAGE_MIN_TOKEN_NUM = int(float(os.environ.get("IMAGE_MIN_TOKEN_NUM", 4)))
+IMAGE_MAX_TOKEN_NUM = int(float(os.environ.get("IMAGE_MAX_TOKEN_NUM", 16384)))
+VIDEO_MIN_TOKEN_NUM = int(float(os.environ.get("VIDEO_MIN_TOKEN_NUM", 128)))
+VIDEO_MAX_TOKEN_NUM = int(float(os.environ.get("VIDEO_MAX_TOKEN_NUM", 768)))
 
-FPS = 2.0
+FPS = float(os.environ.get("FPS", 2))
 FRAME_FACTOR = 2
-FPS_MIN_FRAMES = 4
-FPS_MAX_FRAMES = 768
+FPS_MIN_FRAMES = int(float(os.environ.get("FPS_MIN_FRAMES", 4)))
+FPS_MAX_FRAMES = int(float(os.environ.get("FPS_MAX_FRAMES", 768)))
 MAX_NUM_WORKERS_FETCH_VIDEO = 8
 
 MODEL_SEQ_LEN = int(float(os.environ.get("MODEL_SEQ_LEN", 128000)))

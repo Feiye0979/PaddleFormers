@@ -374,10 +374,14 @@ class WhisperFeatureExtractor(SequenceFeatureExtractor):
             padded_inputs["input_features"] = [np.asarray(feature, dtype=np.float32) for feature in input_features]
         else:
             padded_inputs["input_features"] = input_features
+
         if return_attention_mask:
-            padded_inputs["attention_mask"] = padded_inputs["attention_mask"][:, :: self.hop_length]
+            rescaled_attention_mask = padded_inputs["attention_mask"][:, :: self.hop_length]
+
             if padded_inputs["attention_mask"].shape[1] % self.hop_length != 0:
-                padded_inputs["attention_mask"] = padded_inputs["attention_mask"][:, :-1]
+                rescaled_attention_mask = rescaled_attention_mask[:, :-1]
+            padded_inputs["attention_mask"] = rescaled_attention_mask
+            
         if return_token_timestamps is not None:
             padded_inputs["num_frames"] = [(len(raw_speech_i) // self.hop_length) for raw_speech_i in raw_speech]
         if return_tensors is not None:

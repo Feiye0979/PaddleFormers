@@ -313,6 +313,7 @@ def run_sft(
         model_config.text_config.recompute_method = model_config.recompute_method
         model_config.text_config.recompute_num_layers = model_config.recompute_num_layers
     if getattr(model_config, "vision_config", None) is not None:
+        model_config.vision_config.max_sequence_length = data_args.max_seq_len
         model_config.vision_config._attn_implementation = model_args._attn_implementation
         model_config.vision_config.recompute_granularity = model_config.recompute_granularity
         model_config.vision_config.recompute_method = model_config.recompute_method
@@ -824,5 +825,8 @@ def create_peft_model(model_args, training_args, dtype, model):
             for n in _groups[grp_key]:
                 log_lines.append(f"    {n}")
         logger.info("\n".join(log_lines))
+
+    print("Created Model:")
+    print(model)
 
     return model

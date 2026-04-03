@@ -268,18 +268,18 @@ def get_lora_target_modules(model):
             f".*{_llm}.*\\.v_proj.*",
             f".*{_llm}.*\\.o_proj.*",
             # LLM FFN (dense + MoE experts)
-            f".*{_llm}model.*\\.gate_proj.*",
-            f".*{_llm}model.*\\.up_proj.*",
-            f".*{_llm}model.*\\.down_proj.*",
-            f".*{_llm}model.*\\.gate_up_proj.*",
+            f".*{_llm}.*\\.gate_proj.*",
+            f".*{_llm}.*\\.up_proj.*",
+            f".*{_llm}.*\\.down_proj.*",
+            f".*{_llm}.*\\.gate_up_proj.*",
             # Vision encoder attention + FFN
             f".*{_vision}.*attn\\.qkv.*",
             f".*{_vision}.*attn\\.proj.*",
             f".*{_vision}.*linear_fc1.*",
             f".*{_vision}.*linear_fc2.*",
             # Vision aligner
-            f".*{_vision}.*\\.merger.*mlp.*"
-            f".*{_vision}.*\\.merger_list.*mlp.*"
+            f".*{_vision}.*\\.merger.*mlp.*",
+            f".*{_vision}.*\\.merger_list.*mlp.*",
             # Audio encoder attention + FFN
             f".*{_audio}.*\\.q_proj.*",
             f".*{_audio}.*\\.k_proj.*",

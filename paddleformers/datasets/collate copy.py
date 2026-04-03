@@ -687,18 +687,8 @@ def mm_collate_fn(
         if len(pixel_values_videos) > 0:
             pixel_values_videos = paddle.concat(pixel_values_videos, axis=0)
         if len(input_features) > 0:
-            max_t = max(f.shape[2] for f in input_features)
-            input_features = [
-                paddle.nn.functional.pad(f, [0, max_t - f.shape[2]]) if f.shape[2] < max_t else f
-                for f in input_features
-            ]
             input_features = paddle.concat(input_features, axis=0)
         if len(feature_attention_mask) > 0:
-            max_t = max(m.shape[-1] for m in feature_attention_mask)
-            feature_attention_mask = [
-                paddle.nn.functional.pad(m, [0, max_t - m.shape[-1]]) if m.shape[-1] < max_t else m
-                for m in feature_attention_mask
-            ]
             feature_attention_mask = paddle.concat(feature_attention_mask, axis=0)
         if get_token_type_func is not None:  # ernie45vl
             bs_idx_in_rope = 0

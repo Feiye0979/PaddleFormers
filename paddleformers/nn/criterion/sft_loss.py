@@ -48,16 +48,28 @@ def sft_postprocess_loss(self, masked_lm_loss, labels, loss_mask, **kwargs):
     # 逐位对齐, 全精度聚合
     masked_lm_loss = paddle.sum(masked_lm_loss.cast(paddle.float32).reshape([-1]) * loss_mask)
 
-    # # Use cross-accumulation-step token count if the trainer has set it,
-    # # otherwise fall back to local micro-batch token count.
-    # # This matches the ms-swift / HF-Trainer num_items_in_batch normalization.
+    # ---- Original normalization (per-micro-batch mean) ----
+    # Equivalent to ms-swift ONLY when every micro-batch has the same valid-token
+    # count.  With variable-length responses the two diverge.
+    loss = masked_lm_loss / loss_mask.sum()
+
+    # # ---- Fix-4: cross-accumulation-step token-weighted normalization ----
+    # # Mirrors ms-swift / HF-Trainer behaviour:
+    # #   ms-swift: loss_step_i = sum_tokens_i / total_accum_tokens  (no /grad_accum)
+    # #   PaddleFormers: same denominator; training_step skips /grad_accum when active.
+    # # _num_items_in_batch is set by the trainer to the PREVIOUS window's total valid
+    # # token count (1-window lag).  First window falls back to original behaviour.
     # num_items_in_batch = getattr(self, "_num_items_in_batch", None)
+    
     # if num_items_in_batch is not None and num_items_in_batch > 0:
     #     loss = masked_lm_loss / num_items_in_batch.cast(masked_lm_loss.dtype)
     # else:
     #     loss = masked_lm_loss / loss_mask.sum()
 
-    loss = masked_lm_loss / loss_mask.sum()
+    # print("get num_items_in_batch: ", num_items_in_batch)
+    # print("origin loss: ", masked_lm_loss / loss_mask.sum())
+    # if num_items_in_batch is not None:
+    #     print("new loss: ", masked_lm_loss / num_items_in_batch.cast(masked_lm_loss.dtype))
     loss_sum = masked_lm_loss.sum().detach()
 
     if not self.return_tuple:  # only used in pp

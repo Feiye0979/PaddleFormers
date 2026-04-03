@@ -30,8 +30,10 @@ from PIL import Image
 FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/PaddleFormers/saved_tensors/npy/"
 HACK_FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-swift/saved_tensors/npy/"
 
-run_online = True
-mock_switch = True
+run_online = (os.getenv('FLAGS_run_pd_for_offline', '0') == '0')
+mock_switch = (os.getenv('FLAGS_run_pd_for_concrete', '0') == '1')
+
+mock_by_torch_interpolate = True and mock_switch
 
 
 def compare_and_save(data, name: str, to_save: bool = False, print_tensor: bool = False):
@@ -196,7 +198,7 @@ def resize(
             image = image.to(dtype=paddle.float32)
 
         compare_and_save(image, "image_before_interpolate", True, False)
-        if mock_switch:
+        if mock_by_torch_interpolate:
             import torch
 
             torch_image = torch.from_numpy(image.astype("float32").detach().cpu().numpy()).to(torch.float).to("cuda")

@@ -67,8 +67,8 @@ from .configuration import (
 FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/PaddleFormers/saved_tensors/npy/"
 HACK_FILE_DIR = "/root/paddlejob/workspace/env_run/wuhuiyue_new/qwen3_omni/ms-swift/saved_tensors/npy/"
 
-run_online = True
-mock_switch = False
+run_online = (os.getenv('FLAGS_run_pd_for_offline', '0') == '0')
+mock_switch = (os.getenv('FLAGS_run_pd_for_concrete', '0') == '1')
 
 print_names = [
     "0_input_ids"
