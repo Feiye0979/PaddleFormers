@@ -386,7 +386,17 @@ def mm_dpo_collate_fn(
                 res_position_ids = []
                 for i, input_ids in enumerate([chosen_input_ids, rejected_input_ids]):
                     if seq.has_mm[i]:
-                        pos_ids, _ = get_rope_func(input_ids=paddle.to_tensor([input_ids]), **filtered_args)
+                        input_ids_tensor = paddle.to_tensor([input_ids])
+                        call_args = dict(filtered_args)
+                        if "mm_token_type_ids" in func_params and "mm_token_type_ids" not in call_args:
+                            rope_model = get_rope_func.__self__
+                            mm_token_type_ids = paddle.zeros_like(input_ids_tensor)
+                            if hasattr(rope_model, "image_token_id") and rope_model.image_token_id is not None:
+                                mm_token_type_ids[input_ids_tensor == rope_model.image_token_id] = 1
+                            if hasattr(rope_model, "video_token_id") and rope_model.video_token_id is not None:
+                                mm_token_type_ids[input_ids_tensor == rope_model.video_token_id] = 2
+                            call_args["mm_token_type_ids"] = mm_token_type_ids
+                        pos_ids, _ = get_rope_func(input_ids=input_ids_tensor, **call_args)
                         res_position_ids.append(pos_ids)
                     else:
                         input_ids = paddle.to_tensor([input_ids])
@@ -637,13 +647,20 @@ def mm_collate_fn(
             _has_mm = any(k in mm_inputs for k in ("pixel_values", "pixel_values_videos", "input_features", "image_grid_thw", "video_grid_thw"))
             if get_rope_func is not None and _has_mm:
                 filtered_args = {k: paddle.to_tensor(mm_inputs[k]) for k in func_params if k in mm_inputs}
-                attn_mask = gen_self_attn_mask(
-                    original_token_ids, sum(len(t) for t in original_token_ids), model_args.use_global_causal_attn
-                )
-                filtered_args["attention_mask"] = paddle.to_tensor(attn_mask[0, 0, -1:, :])
+                total_input_ids = paddle.to_tensor([seq.token_ids])
+                filtered_args["attention_mask"] = paddle.ones_like(total_input_ids)
                 if "video_second_per_grid" in mm_inputs:
                     filtered_args["second_per_grids"] = mm_inputs["video_second_per_grid"]
-                position_ids, _ = get_rope_func(input_ids=paddle.to_tensor([seq.token_ids]), **filtered_args)
+
+                if "mm_token_type_ids" in func_params and "mm_token_type_ids" not in filtered_args:
+                    rope_model = get_rope_func.__self__
+                    mm_token_type_ids = paddle.zeros_like(total_input_ids)
+                    if hasattr(rope_model, "image_token_id") and rope_model.image_token_id is not None:
+                        mm_token_type_ids[total_input_ids == rope_model.image_token_id] = 1
+                    if hasattr(rope_model, "video_token_id") and rope_model.video_token_id is not None:
+                        mm_token_type_ids[total_input_ids == rope_model.video_token_id] = 2
+                    filtered_args["mm_token_type_ids"] = mm_token_type_ids
+                position_ids, _ = get_rope_func(input_ids=total_input_ids, **filtered_args)
                 original_position_ids.append(position_ids)
             elif get_rope_func is not None and not _has_mm:
                 # Pure text: build 3D position_ids as numpy to avoid GPU ops in prefetch thread

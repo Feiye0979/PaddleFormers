@@ -20,6 +20,9 @@ import warnings
 from typing import Optional, Sequence, Union
 
 import numpy as np
+import paddle
+
+AudioInput = Union[np.ndarray, "paddle.Tensor", Sequence[np.ndarray], Sequence["paddle.Tensor"]]
 
 AudioInput = Union[np.ndarray, "paddle.Tensor", Sequence[np.ndarray], Sequence["paddle.Tensor"]]
 

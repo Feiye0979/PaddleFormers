@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from ...utils.lazy_import import _LazyModule
 
 import_structure = {
+    "processor": ["Qwen3OmniMoeProcessor"],
     "configuration": ["Qwen3OmniMoeConfig", "Qwen3OmniMoeThinkerConfig", "Qwen3OmniMoeTextConfig"],
     "modeling": [
         "Qwen3OmniMoeForConditionalGeneration",

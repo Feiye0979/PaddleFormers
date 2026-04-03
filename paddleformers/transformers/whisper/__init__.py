@@ -1,5 +1,4 @@
-# Copyright (c) 2024 PaddlePaddle Authors. All Rights Reserved.
-# Copyright 2024 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
+# Copyright (c) 2025 PaddlePaddle Authors. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,22 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from typing import TYPE_CHECKING
+import gc
 
-from ...utils.lazy_import import _LazyModule
+from paddleformers.trainer.trainer_callback import TrainerCallback
 
-import_structure = {
-    "processor": ["WhisperFeatureExtractor"],
-}
 
-if TYPE_CHECKING:
-    from .processor import *
+class GCCallback(TrainerCallback):
+    def on_train_begin(self, args, state, control, **kwargs):
+        if args.gc_interval > 0:
+            gc.disable()
 
-else:
-    sys.modules[__name__] = _LazyModule(
-        __name__,
-        globals()["__file__"],
-        import_structure,
-        module_spec=__spec__,
-    )
+    def on_step_end(self, args, state, control, **kwargs):
+        if args.gc_interval > 0 and (state.global_step % args.gc_interval == 0):
+            gc.collect()

@@ -17,16 +17,23 @@ import json
 import os
 from collections import OrderedDict
 
+from transformers import AutoConfig
+from transformers.dynamic_module_utils import (
+    get_class_from_dynamic_module,
+    resolve_trust_remote_code,
+)
 from transformers.models.auto.configuration_auto import (
-    CONFIG_MAPPING_NAMES,
+    CONFIG_NAME,
     model_type_to_module_name,
 )
+from transformers.models.auto.feature_extraction_auto import (
+    FEATURE_EXTRACTOR_MAPPING,
+    FEATURE_EXTRACTOR_NAME,
+)
+from transformers.utils import PROCESSOR_NAME
 
-from paddleformers.transformers import AutoConfig
-from paddleformers.transformers.processing_utils import PROCESSOR_NAME
-from paddleformers.utils.download.download import resolve_file_path
-from paddleformers.utils.log import logger
-
+from ...utils.download import resolve_file_path
+from ...utils.log import logger
 from ..configuration_utils import PretrainedConfig
 from ..feature_extraction_utils import FeatureExtractionMixin
 
@@ -58,7 +65,7 @@ def feature_extractor_class_from_name(class_name: str):
             except AttributeError:
                 continue
 
-    for extractor in FEATURE_EXTRACTOR_MAPPING_NAMES._extra_content.values():
+    for extractor in FEATURE_EXTRACTOR_MAPPING._extra_content.values():
         if getattr(extractor, "__name__", None) == class_name:
             return extractor
 
@@ -217,38 +224,38 @@ class AutoFeatureExtractor:
 
         if feature_extractor_class is not None:
             feature_extractor_class = feature_extractor_class_from_name(feature_extractor_class)
-
         has_remote_code = feature_extractor_auto_map is not None
-        # has_local_code = feature_extractor_class is not None or type(config) in FEATURE_EXTRACTOR_MAPPING_NAMES
-        # if has_remote_code:
-        # if "--" in feature_extractor_auto_map:
-        #     upstream_repo = feature_extractor_auto_map.split("--")[0]
-        # else:
-        #     upstream_repo = None
-        # trust_remote_code = resolve_trust_remote_code(
-        #     trust_remote_code, pretrained_model_name_or_path, has_local_code, has_remote_code, upstream_repo
-        # )
+        has_local_code = feature_extractor_class is not None or type(config) in FEATURE_EXTRACTOR_MAPPING
+        if has_remote_code:
+            if "--" in feature_extractor_auto_map:
+                upstream_repo = feature_extractor_auto_map.split("--")[0]
+            else:
+                upstream_repo = None
+            trust_remote_code = resolve_trust_remote_code(
+                trust_remote_code, pretrained_model_name_or_path, has_local_code, has_remote_code, upstream_repo
+            )
 
         if has_remote_code and trust_remote_code:
 
-            # feature_extractor_class = get_class_from_dynamic_module(
-            #     feature_extractor_auto_map, pretrained_model_name_or_path, **kwargs
-            # )
+            feature_extractor_class = get_class_from_dynamic_module(
+                feature_extractor_auto_map, pretrained_model_name_or_path, **kwargs
+            )
 
             _ = kwargs.pop("code_revision", None)
             feature_extractor_class.register_for_auto_class()
             return feature_extractor_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         elif feature_extractor_class is not None:
+
             return feature_extractor_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         # Last try: we use the FEATURE_EXTRACTOR_MAPPING.
-        elif type(config) in FEATURE_EXTRACTOR_MAPPING_NAMES:
-            feature_extractor_class = FEATURE_EXTRACTOR_MAPPING_NAMES[type(config)]
+        elif type(config) in FEATURE_EXTRACTOR_MAPPING:
+            feature_extractor_class = FEATURE_EXTRACTOR_MAPPING[type(config)]
             return feature_extractor_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
 
         raise ValueError(
             f"Unrecognized feature extractor in {pretrained_model_name_or_path}. Should have a "
-            f"`feature_extractor_type` key in its {FEATURE_EXTRACTOR_MAPPING_NAMES} of {CONFIG_MAPPING_NAMES}, or one of the following "
-            f"`model_type` keys in its {CONFIG_MAPPING_NAMES}: {', '.join(c for c in FEATURE_EXTRACTOR_MAPPING_NAMES)}"
+            f"`feature_extractor_type` key in its {FEATURE_EXTRACTOR_NAME} of {CONFIG_NAME}, or one of the following "
+            f"`model_type` keys in its {CONFIG_NAME}: {', '.join(c for c in FEATURE_EXTRACTOR_MAPPING_NAMES)}"
         )
 
     @staticmethod
@@ -261,4 +268,4 @@ class AutoFeatureExtractor:
                 The configuration corresponding to the model to register.
             feature_extractor_class ([`FeatureExtractorMixin`]): The feature extractor to register.
         """
-        FEATURE_EXTRACTOR_MAPPING_NAMES.register(config_class, feature_extractor_class, exist_ok=exist_ok)
+        FEATURE_EXTRACTOR_MAPPING.register(config_class, feature_extractor_class, exist_ok=exist_ok)

@@ -19,9 +19,10 @@ tiktoken
 ml_dtypes
 omegaconf
 modelscope
-transformers>=5.0.0
+transformers>=5.0.0, <5.4.0
 GPUtil
 importlib_metadata
+librosa
 binpacking
 orjson
 librosa
